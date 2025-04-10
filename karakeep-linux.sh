@@ -9,13 +9,10 @@ set -Eeuo pipefail
 # License: MIT
 
 # Basic error handling
-trap 'catch $? $LINENO' ERR
+trap 'catch $?' ERR
 
 catch() {
-  if [ "$1" == 0 ]; then
-    return
-  fi
-  echo "Caught error $1 on line $2"
+  echo "Caught error $1 on line ${BASH_LINENO[0]}"
 }
 
 OS="$(awk -F'=' '/^VERSION_CODENAME=/{ print $NF }' /etc/os-release)"
