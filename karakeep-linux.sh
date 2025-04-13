@@ -9,21 +9,80 @@ set -Eeuo pipefail
 # License: MIT
 
 # Basic error handling
-trap 'catch $? $LINENO' ERR
+trap 'catch $?' ERR
 
 catch() {
-  if [ "$1" == 0 ]; then
-    return
-  fi
-  echo "Caught error $1 on line $2"
+  echo "Caught error $1 on line ${BASH_LINENO[0]}"
 }
 
+# Global Vars
 OS="$(awk -F'=' '/^VERSION_CODENAME=/{ print $NF }' /etc/os-release)"
 INSTALL_DIR=/opt/karakeep
 export DATA_DIR=/var/lib/karakeep
 CONFIG_DIR=/etc/karakeep
 LOG_DIR=/var/log/karakeep
 ENV_FILE=${CONFIG_DIR}/karakeep.env
+BRWSR_URL="http://127.0.0.1:9222"
+BRWSR_RELEASE=$(curl -s https://api.github.com/repos/browserless/browserless/tags?per_page=1 | grep "name" | awk '{print substr($2, 3, length($2)-4) }')
+BRWSR_INSTALL=/opt/browserless
+BRWSR_ENV="$BRWSR_INSTALL"/.env
+
+# Functions
+browserless_build() {
+  tmp_file=$(mktemp)
+  wget -q https://github.com/browserless/browserless/archive/refs/tags/v"${BRWSR_RELEASE}".zip -O "$tmp_file"
+  unzip -q "$tmp_file"
+  mv browserless-"${BRWSR_RELEASE}" "$BRWSR_INSTALL"
+  cd "$BRWSR_INSTALL" && npm install
+  rm -rf ./src/routes/{chrome,edge,firefox,webkit}
+  echo "Installing Chromium browser" && sleep 1
+  export PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+  ./node_modules/playwright-core/cli.js install --with-deps chromium
+  echo "Chromium browser installed" && sleep 1
+  npm run build
+  npm run build:function
+  npm prune production
+  rm -f "$tmp_file"
+}
+
+browserless_post() {
+  cd "$BRWSR_INSTALL"
+  if ! grep -q ONDEMAND "$ENV_FILE"; then
+    sed -i "/BROWSER_WEB/a BROWSER_CONNECT_ONDEMAND=true" "$ENV_FILE"
+  else
+    sed -i "s/ONDEMAND=false/ONDEMAND=true/" "$ENV_FILE"
+  fi
+
+  cat <<EOF >"$BRWSR_ENV"
+DEBUG=browserless*,-**:verbose
+HOST=127.0.0.1
+PORT=9222
+PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+EOF
+
+  cat <<EOF >/etc/systemd/system/karakeep-browser.service
+[Unit]
+Description=Karakeep Browserless service
+After=network.target
+
+[Service]
+User=browserless
+Group=browserless
+Restart=unless-stopped
+WorkingDirectory=${BRWSR_INSTALL}
+EnvironmentFile=${BRWSR_ENV}
+ExecStart=/usr/bin/npm run start
+TimeoutStopSec=5
+SyslogIdentifier=karakeep-browser
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  useradd -U -s /usr/sbin/nologin -r -M -d /opt/browserless browserless
+  echo "$BRWSR_RELEASE" >/opt/browserless/version.txt
+  chown -R browserless:browserless "$BRWSR_INSTALL" /opt/pw-browsers
+}
 
 install() {
   echo "Karakeep installation for Debian 12/Ubuntu 24.04" && sleep 4
@@ -39,12 +98,8 @@ install() {
     ghostscript \
     ca-certificates
   if [[ "$OS" == "noble" ]]; then
-    apt-get install -y software-properties-common
-    add-apt-repository ppa:xtradeb/apps -y
-    apt-get install --no-install-recommends -y ungoogled-chromium yt-dlp
-    ln -s /usr/bin/ungoogled-chromium /usr/bin/chromium
+    apt-get install -y yt-dlp
   else
-    apt-get install --no-install-recommends -y chromium
     wget -q https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -O /usr/bin/yt-dlp && chmod +x /usr/bin/yt-dlp
   fi
 
@@ -73,7 +128,8 @@ install() {
   cd /tmp
   wget -q "https://github.com/karakeep-app/karakeep/archive/refs/tags/v${RELEASE}.zip"
   unzip -q v"$RELEASE".zip
-  mv karakeep-"$RELEASE" "$INSTALL_DIR" && cd "$INSTALL_DIR"/apps/web
+  mv karakeep-"$RELEASE" "$INSTALL_DIR"
+  cd "$INSTALL_DIR"/apps/web
   corepack enable
   export NEXT_TELEMETRY_DISABLED=1
   export PUPPETEER_SKIP_DOWNLOAD="true"
@@ -89,8 +145,11 @@ install() {
   pnpm migrate
   echo "Installed Karakeep" && sleep 1
 
-  echo "Creating configuration files..."
-  cd "$INSTALL_DIR"
+  echo "Installing Browserless" && sleep 1
+  browserless_build
+  echo "Installed Browserless" && sleep 1
+
+  echo "Creating configuration files..." && sleep 1
   MASTER_KEY="$(openssl rand -base64 12)"
   cat <<EOF >${M_CONFIG_FILE}
 env = "production"
@@ -111,7 +170,8 @@ NEXTAUTH_URL="http://localhost:3000"
 DATA_DIR=${DATA_DIR}
 MEILI_ADDR="http://127.0.0.1:7700"
 MEILI_MASTER_KEY="${MASTER_KEY}"
-BROWSER_WEB_URL="http://127.0.0.1:9222"
+BROWSER_WEB_URL=${BRWSR_URL}
+BROWSER_CONNECT_ONDEMAND=true
 # CRAWLER_VIDEO_DOWNLOAD=true
 # CRAWLER_VIDEO_DOWNLOAD_MAX_SIZE=
 # OPENAI_API_KEY=
@@ -120,13 +180,16 @@ BROWSER_WEB_URL="http://127.0.0.1:9222"
 # INFERENCE_IMAGE_MODEL=
 EOF
   chmod 600 "$ENV_FILE"
+
   echo "$RELEASE" >"$INSTALL_DIR"/version.txt
+  browserless_post
   echo "Configuration complete" && sleep 1
 
   echo "Creating users and modifying permissions..."
   useradd -U -s /usr/sbin/nologin -r -m -d "$M_DATA_DIR" meilisearch
   useradd -U -s /usr/sbin/nologin -r -M -d "$INSTALL_DIR" karakeep
   chown meilisearch:meilisearch "$M_CONFIG_FILE"
+  touch "$LOG_DIR"/{karakeep-workers.log,karakeep-web.log}
   chown -R karakeep:karakeep "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR"
   echo "Users created, permissions modified" && sleep 1
 
@@ -161,22 +224,6 @@ PrivateDevices=yes
 PrivateTmp=true
 CapabilityBoundingSet=
 RemoveIPC=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  cat <<EOF >/etc/systemd/system/karakeep-browser.service
-[Unit]
-Description=Karakeep headless browser
-After=network.target
-
-[Service]
-User=root
-Restart=on-failure
-ExecStart=/usr/bin/chromium --headless --no-sandbox --disable-gpu --disable-dev-shm-usage --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --hide-scrollbars
-TimeoutStopSec=5
-SyslogIdentifier=karakeep-browser
 
 [Install]
 WantedBy=multi-user.target
@@ -293,14 +340,39 @@ update() {
     systemctl restart karakeep.target
     service_check update
   else
-    echo "No update required."
+    echo "No Karakeep update required."
   fi
+
+  if [[ -d /opt/browserless ]]; then BRWSR_INSTALLED=1; else BRWSR_INSTALLED=0; fi
+  if [[ "$BRWSR_INSTALLED" == 0 ]]; then
+    echo "Browserless is not installed! Installing it now" && sleep 1
+    systemctl stop karakeep-workers karakeep-browser karakeep-web
+    if [[ $OS == "noble" ]]; then apt-get autoremove -y ungoogled-chromium; else apt-get autoremove -y chromium; fi
+    browserless_build
+    browserless_post
+    systemctl daemon-reload
+    systemctl start karakeep-web karakeep-browser
+    sleep 5 && systemctl start karakeep-workers
+    echo "Finished installing & configuring Browserless!" && sleep 1
+  elif [[ "$BRWSR_INSTALLED" == 1 ]] && [[ "$BRWSR_RELEASE" != $(cat /opt/browserless/version.txt) ]]; then
+    echo "Updating Browserless..." && sleep 1
+    systemctl stop karakeep-browser karakeep-workers
+    cp /opt/browserless/.env /opt/browserless.env
+    rm -rf /opt/browserless
+    browserless_build
+    mv /opt/browserless.env /opt/browserless/.env
+    systemctl start karakeep-browser karakeep-workers
+    echo "Browserless updated!" && sleep 1
+  else
+    echo "No updates for Browserless" && sleep 1
+  fi
+  echo "Operations complete"
   exit 0
 }
 
 migrate() {
   if [[ ! -d /opt/karakeep ]]; then
-    echo "Migrating your Hoarder installation to Karakeep, then checking for an update..." && sleep 3
+    echo "Migrating your Hoarder installation to Karakeep, then checking for an update..." && sleep 2
     systemctl stop hoarder-browser hoarder-workers hoarder-web
     sed -i -e "s|hoarder|karakeep|g" /etc/hoarder/hoarder.env /etc/systemd/system/hoarder-{browser,web,workers}.service /etc/systemd/system/hoarder.target \
       -e "s|Hoarder|Karakeep|g" /etc/systemd/system/hoarder-{browser,web,workers}.service /etc/systemd/system/hoarder.target
