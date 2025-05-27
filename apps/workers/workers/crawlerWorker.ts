@@ -91,12 +91,17 @@ async function startBrowserInstance() {
     width: 1440,
     height: 900,
   };
+  const launchArgs = {
+    headless: false,
+    stealth: true,
+    blockConsentModals: true,
+  };
   if (serverConfig.crawler.browserWebSocketUrl) {
     logger.info(
       `[Crawler] Connecting to existing browser websocket address: ${serverConfig.crawler.browserWebSocketUrl}`,
     );
     return puppeteer.connect({
-      browserWSEndpoint: serverConfig.crawler.browserWebSocketUrl,
+      browserWSEndpoint: `serverConfig.crawler.browserWebSocketUrl&launch=${JSON.stringify(launchArgs)}`,
       defaultViewport,
     });
   } else if (serverConfig.crawler.browserWebUrl) {
@@ -111,7 +116,7 @@ async function startBrowserInstance() {
       `[Crawler] Successfully resolved IP address, new address: ${webUrl.toString()}`,
     );
     return puppeteer.connect({
-      browserURL: webUrl.toString(),
+      browserURL: `webUrl.toString()&launch=${JSON.stringify(launchArgs)}`,
       defaultViewport,
     });
   } else {
